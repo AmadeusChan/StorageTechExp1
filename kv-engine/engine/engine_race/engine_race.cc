@@ -141,11 +141,19 @@ RetCode DataStore::OpenCurFile() {
   return kSucc;
 }
 
+RetCode DataStore::Sync() {
+	if (fsync(fd_) != 0) {
+		return kIOError;
+	}
+	barrier();
+	return kSucc;
+}
+
 /**********************************************************
  * Door Plate
  * ********************************************************/
 
-static const uint32_t kMaxDoorCnt = 1024 * 1024 * 32;
+static const uint32_t kMaxDoorCnt = 1024 * 128;
 static const char kMetaFileName[] = "META";
 static const int kMaxRangeBufCount = kMaxDoorCnt;
 
@@ -271,6 +279,14 @@ RetCode DoorPlate::Find(const std::string& key, Location *location) {
 
   *location = (items_ + index)->location;
   return kSucc;
+}
+
+RetCode DoorPlate::Sync() {
+	const int map_size = kMaxDoorCnt * sizeof(Item);
+	if (msync(items_, map_size, MS_SYNC) != 0) {
+		return kIOError;
+	}
+	return kSucc;
 }
 
 RetCode DoorPlate::GetRangeLocation(const std::string& lower,
@@ -408,153 +424,172 @@ int UnlockFile(FileLock* lock) {
  * 3. After reboot, check if the log and finished all unfinished jobs;
  ************************************************************/
 
-static const int kMaxLogEntryCnt = 128;
+static const int kMaxLogEntryCnt = 8 * 1024; 
 static const char kLogFileName[] = "LOG";
 
 WriteAheadLog::WriteAheadLog(const std::string &path):
-	dir_(path), fd_(-1), log_entrys_(NULL){
+	dir_(path), fd_(-1){
 }
 
 WriteAheadLog::~WriteAheadLog() {
 	if (fd_ > 0) {
-		const int map_size = kMaxLogEntryCnt * sizeof(LogEntry);
-		munmap(log_entrys_, map_size);
 		close(fd_);
 	}
 }
 
 RetCode WriteAheadLog::Init() {
-	bool new_create = false;
-	const int map_size = kMaxLogEntryCnt * sizeof(LogEntry);
-
-	if (!FileExists(dir_) 
-			&& 0 != mkdir(dir_.c_str(), 0755)) {
+	if (!FileExists(dir_) && mkdir(dir_.c_str(), 0755) != 0) {
 		return kIOError;
 	}
-
-	std::string path = dir_ + "/" + kLogFileName;
-	int fd = open(path.c_str(), O_RDWR, 0644);
-	if (fd < 0 && errno == ENOENT) { // the file doesn't exist
-		fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
-		if (fd >= 0) {
-			new_create = true;
-			if (posix_fallocate(fd, 0, map_size) != 0) {
-				std::cerr << "posix_fallocate failed: " << strerror(errno) << std::endl;
-				close(fd);
-				return kIOError;
-			}
-		}
-	}
+	std::string file_name = dir_ + "/" + std::string(kLogFileName);
+	int fd = open(file_name.c_str(), O_APPEND | O_RDWR | O_CREAT, 0644); // not using direct IO
 	if (fd < 0) {
 		return kIOError;
 	}
 	fd_ = fd;
+	log_entry_cnt_ = 0;
+	return kSucc;
+}
 
-	void * ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-	if (ptr == MAP_FAILED) {
-		std::cerr << "MAP_FAILED: " << strerror(errno) << std::endl;
-		close(fd);
+int FileAppend(int fd, const char * start, size_t len) {
+	if (fd < 0) {
+		std::cout << "Something Wrong with fd!" << std::endl;
+		return -1;
+	}
+	size_t value_len = len;
+	const char * pos = start;
+	while (value_len > 0) {
+		ssize_t r = write(fd, pos, value_len);
+		if (r < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+        		std::cerr << "append log file failed: " << strerror(errno) << std::endl;
+			return -1;
+		}
+		pos += r;
+		value_len -= r;
+	}
+	return 0;
+}
+
+RetCode WriteAheadLog::Append(const std::string &key, const std::string &value, uint8_t parity) { 
+	if (log_entry_cnt_ >= kMaxLogEntryCnt) {
+		return kFull;
+	}
+	log_entry_cnt_ ++;
+
+	uint32_t key_size = key.size();
+	const char * key_data = key.data();
+	uint32_t value_size = value.size();
+	const char * value_data = value.data();
+
+	if (FileAppend(fd_, (char *)(&key_size), sizeof(uint32_t)) != 0) return kIOError;
+	if (FileAppend(fd_, key_data, key_size) != 0) return kIOError;
+	if (FileAppend(fd_, (char *)(&value_size), sizeof(uint32_t)) != 0) return kIOError;
+	if (FileAppend(fd_, value_data, value_size) != 0) return kIOError;
+	if (FileAppend(fd_, (char *)(&parity), sizeof(uint8_t)) != 0) return kIOError;
+	
+	return kSucc;
+}
+
+RetCode WriteAheadLog::SyncLog() {
+	int ret = fsync(fd_);
+	if (ret != 0) {
 		return kIOError;
 	}
-	if (new_create) {
-		memset(ptr, 0, map_size);
-	}
-
-	log_entrys_ = reinterpret_cast<LogEntry*>(ptr);
-	current_index = 0;
+	barrier();
 	return kSucc;
 }
 
-RetCode WriteAheadLog::Append(const std::string &key, const std::string &value) { 
-	int index;
+RetCode ReadFile(int fd, char * buffer, uint32_t count) {
+	char * pos = buffer;
+	uint32_t value_len = count;
+
+	while (value_len > 0) {
+		ssize_t r = read(fd, pos, value_len);
+		if (r <= 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return kIOError;
+		}
+		pos += r;
+		value_len -= r;
+	}
+	return kSucc;
+}
+
+RetCode WriteAheadLog::GetValidLogs(std::vector<std::pair<std::string, std::string>> *valid_logs) {
+	//std::cout << "Get Valid Logs..." << std::endl;
+	lseek(fd_, 0, SEEK_SET);
+
+	uint32_t key_size;
+	char key[kMaxKeyLen];
+	uint32_t value_size;
+	char value[kMaxValueLen];
+	uint8_t parity, actual_parity;
+	RetCode ret;
+
 	while (true) {
-		index = __sync_fetch_and_add(&current_index, 1);
-		if (index < kMaxLogEntryCnt) break; // the entry is valid
+		ret = ReadFile(fd_, (char *)&key_size, sizeof(uint32_t));
+		if (ret != kSucc) break;
+		ret = ReadFile(fd_, key, key_size);
+		if (ret != kSucc) break;
+		ret = ReadFile(fd_, (char *)&value_size, sizeof(uint32_t));
+		if (ret != kSucc) break;
+		ret = ReadFile(fd_, value, value_size);
+		if (ret != kSucc) break;
+		ret = ReadFile(fd_, (char *)&parity, sizeof(uint8_t));
+		if (ret != kSucc) break;
+
+		std::string key_str(key, key_size);
+		std::string value_str(value, value_size);
+		actual_parity = WriteAheadLog::CalcParity(key_size, key_str, value_size, value_str);
+		if (actual_parity != parity) break;
+
+		valid_logs->push_back(make_pair(key_str, value_str));
+		//std::cout << "Valid Log Cnt: " << valid_logs->size() << std::endl;
 	}
-	if (index < 0) {
-		return kFull; // the log entris are all used, which means the user should sync all change to the disk and diable all log entries before perform the lattest write operation
-	}
 
-	LogEntry * entry = log_entrys_ + index;
-	memcpy(entry->key, key.data(), key.size());
-	entry->key_size = key.size();
-	memcpy(entry->value, value.data(), value.size());
-	entry->value_size = value.size();
-
-	uint32_t begin = sizeof(LogEntry) * index / PAGESIZE * PAGESIZE; // 4K alignment
-	uint32_t end = sizeof(LogEntry) * index + key.size();
-	if (end % PAGESIZE != 0) {
-		end = end / PAGESIZE * PAGESIZE + PAGESIZE;
-	} 
-
-
-	if (msync((void*)(log_entrys_) + begin, end - begin, MS_SYNC) != 0) return kIOError;
-	//if (msync(entry->value, value.size(), MS_SYNC) != 0) return kIOError;
-	//if (msync(&entry->key_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
-	//if (msync(&entry->value_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
-	barrier();
-
-	entry->valid = 1;
-	//if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError;
-	barrier();
-
-	return kSucc;
-}
-
-RetCode WriteAheadLog::GetValidLogs(std::vector<std::pair<std::string ,std::string>> *valid_logs) {
-	// TODO
+	//std::cout << "Valid Log Cnt: " << valid_logs->size() << std::endl;
+	
 	return kSucc;
 }
 
 RetCode WriteAheadLog::DisableAllLogs() {
-	LogEntry * entry;
-	for (int i = 0; i < kMaxLogEntryCnt; ++ i) {
-		entry = log_entrys_ + i;
-		entry->valid = 0;
-		//if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError; TODO
+	if (ftruncate(fd_, 0) != 0) { // simply truncate the log file
+        	std::cerr << "trunc log file failed: " << strerror(errno) << std::endl;
+		return kIOError;
 	}
-	current_index = 0;
-	barrier();
+	log_entry_cnt_ = 0;
 	return kSucc;
 }
 
-int WriteAheadLog::GetFreeLogEntryIndex() {
-	for (; current_index < kMaxLogEntryCnt; ++ current_index) {
-		if (! IsValid(log_entrys_ + current_index)) {
-			return current_index;
-		}
-	}
-	return -1;
-}
+uint8_t WriteAheadLog::CalcParity(uint32_t key_size, const std::string &key, uint32_t value_size, const std::string &value) {
+	uint8_t parity = 0;
 
-//void WriteAheadLog::SetParity(LogEntry * entry) {
-//	entry->parity = 0;
-//	uint8_t checksum = 0;
-//	const uint32_t entry_size = sizeof(LogEntry);
-//	uint8_t * entry_pos = (uint8_t *) entry;
-//	for (uint32_t i = 0; i < entry_size; ++ i) {
-//		checksum ^= (*entry_pos);
-//		entry_pos ++;
-//	}
-//	entry->parity = checksum;
-//}
-
-bool WriteAheadLog::IsValid(LogEntry * entry) {
-	if (entry->valid != 1) { // if the valid byte is 0, then this entry is not valid
-		return false;
+	uint8_t * pos = (uint8_t*)(&key_size);
+	for (uint32_t i = 0; i < sizeof(uint32_t); ++ i) {
+		parity ^= *(pos + i);
 	}
-	return true;
-	//uint8_t checksum = 0;
-	//const uint32_t entry_size = sizeof(LogEntry);
-	//uint8_t * entry_pos = (uint8_t*) entry;
-	//for (uint32_t i = 0; i < entry_size; ++ i) {
-	//	checksum ^= (*entry_pos);
-	//	entry_pos ++;
-	//}
-	//if (entry_pos != 0) { // if the parity is wrong, this entry is also invalid
-	//	return false;
-	//}
-	//return true;
+	
+	pos = (uint8_t*)key.data();
+	for (uint32_t i = 0; i < key_size; ++ i) {
+		parity ^= *(pos + i);
+	}
+
+	pos = (uint8_t*)(&value_size);
+	for (uint32_t i = 0; i < sizeof(uint32_t); ++ i) {
+		parity ^= *(pos + i);
+	}
+
+	pos = (uint8_t*)value.data();
+	for (uint32_t i = 0; i < value_size; ++ i) {
+		parity ^= *(pos + i);
+	}
+
+	return parity;
 }
 
 /************************************************************
@@ -606,6 +641,13 @@ RetCode EngineRace::Open(const std::string& name, Engine** eptr) {
   }
 
   *eptr = engine_race;
+
+  std::vector<std::pair<std::string, std::string>> valid_logs;
+  engine_race->write_ahead_log_.GetValidLogs(&valid_logs);
+  for (int i = 0, j = valid_logs.size(); i < j; ++ i) {
+	  engine_race->Write(PolarString(valid_logs[i].first), PolarString(valid_logs[i].second));
+  }
+
   return kSucc;
 }
 
@@ -623,38 +665,57 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
   // 2. write the WAL before perform actual write operation
   // 3. disable the log after write operation
   
-  //pthread_mutex_lock(&log_mu_);
+  std::string key_str = key.ToString();
+  std::string value_str = value.ToString();
+
+  uint8_t parity = WriteAheadLog::CalcParity(key_str.size(), key_str, value_str.size(), value_str);
+
+  pthread_mutex_lock(&log_mu_);
   {
-          RetCode ret = write_ahead_log_.Append(key.ToString(), value.ToString());
-          if (ret != kSucc) {
-                  if (ret == kFull) { // all log entries have been used
-			  //std::cout << "log table is full..\n";
-                	  // TODO do something...
-                	  write_ahead_log_.DisableAllLogs();
-                	  ret = write_ahead_log_.Append(key.ToString(), value.ToString());
-                	  if (ret != kSucc) {
-				  std::cout << "still not success...\n";
-                	  	//pthread_mutex_unlock(&log_mu_);
-                	  	return ret;
-                	  }
-                  } else {
-			  std::cout << "PageSize: " << PAGESIZE << std::endl;
-			  std::cout << "other mis?\n";
-			  std::cout << "is kioerror?" << (ret == kIOError) << std::endl;
-                	  //pthread_mutex_unlock(&log_mu_);
-                	  return ret;
-                  }
-          }
+	  RetCode ret = write_ahead_log_.Append(key_str, value_str, parity);
+	  if (ret != kSucc) {
+		  if (ret == kFull) {
+			  //std::cout << "Log is Full" << std::endl;
+			  ret = store_.Sync();
+			  if (ret != kSucc) {
+				  pthread_mutex_unlock(&log_mu_);
+				  return kIOError;
+			  }
+			  ret = plate_.Sync();
+			  if (ret != kSucc) {
+				  pthread_mutex_unlock(&log_mu_);
+				  return kIOError;
+			  }
+			  ret = write_ahead_log_.DisableAllLogs();
+			  if (ret != kSucc) {
+				  //std::cout << "Disable Logs Failed!" << std::endl;
+				  pthread_mutex_unlock(&log_mu_);
+				  return ret;
+			  }
+			  ret = write_ahead_log_.Append(key_str, value_str, parity);
+			  if (ret != kSucc) {
+				  //std::cout << "Still Fail!" << std::endl;
+				  pthread_mutex_unlock(&log_mu_);
+				  return ret;
+			  }
+		  } else {
+			  //std::cout << "Other Mistake!" << std::endl;
+			  pthread_mutex_unlock(&log_mu_);
+			  return ret;
+		  }
+	  }
   }
-  //pthread_mutex_unlock(&log_mu_);
+  pthread_mutex_unlock(&log_mu_);
 
   pthread_mutex_lock(&mu_);
   Location location;
-  RetCode ret = store_.Append(value.ToString(), &location);
+  RetCode ret = store_.Append(value_str, &location);
   if (ret == kSucc) {
-	  ret = plate_.AddOrUpdate(key.ToString(), location);
+	  ret = plate_.AddOrUpdate(key_str, location);
   }
   pthread_mutex_unlock(&mu_);
+
+  ret = write_ahead_log_.SyncLog(); // sync the log file
 
   return ret;
 }

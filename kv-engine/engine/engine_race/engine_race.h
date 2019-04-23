@@ -47,6 +47,7 @@ class DataStore  {
   RetCode Init();
   RetCode Read(const Location& l, std::string* value);
   RetCode Append(const std::string& value, Location* location);
+  RetCode Sync();
 
  private:
   int fd_;
@@ -84,6 +85,8 @@ class DoorPlate  {
     RetCode GetRangeLocation(const std::string& lower, const std::string& upper,
         std::map<std::string, Location> *locations);
 
+    RetCode Sync();
+
  private:
     std::string dir_;
     int fd_;
@@ -103,6 +106,7 @@ uint32_t StrHash(const char* s, int size);
 int GetDirFiles(const std::string& dir, std::vector<std::string>* result);
 int GetFileLength(const std::string& file);
 int FileAppend(int fd, const std::string& value);
+int FileAppend(int fd, const char * start, size_t len);
 bool FileExists(const std::string& path);
 
 // FileLock
@@ -127,32 +131,23 @@ int UnlockFile(FileLock* l);
  * Write-ahead log
  * *************************************/
 
-struct LogEntry {
-	char key[kMaxKeyLen];
-	char value[kMaxValueLen];
-	uint32_t key_size;
-	uint32_t value_size;
-	uint8_t valid;
-} __attribute__((packed));
-
 class WriteAheadLog {
 	public:
 		explicit WriteAheadLog(const std::string &path);
 		~WriteAheadLog();
 
+		static uint8_t CalcParity(uint32_t key_size, const std::string &key, uint32_t value_size, const std::string &value);
+
 		RetCode Init();
-		RetCode Append(const std::string &key, const std::string &value);
+		RetCode Append(const std::string &key, const std::string &value, uint8_t parity);
 		RetCode GetValidLogs(std::vector<std::pair<std::string, std::string>> *valid_logs); // vector<pair<key, value>>
 		RetCode DisableAllLogs();
+		inline RetCode SyncLog();
 	private:
 		std::string dir_;
 		int fd_;
-		LogEntry * log_entrys_;
-		volatile int current_index;
+		int log_entry_cnt_;
 
-		inline bool IsValid(LogEntry * entry);
-		inline int GetFreeLogEntryIndex();
-		//void SetParity(LogEntry * entry);
 };
 
 /****************************************
