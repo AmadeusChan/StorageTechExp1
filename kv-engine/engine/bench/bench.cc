@@ -5,7 +5,7 @@
 #include "include/engine.h"
 
 #define MAX_THREAD 64
-#define OP_PER_THREAD 200000ull
+#define OP_PER_THREAD 50000ull
 #define KEY_SPACE (OP_PER_THREAD * 4)
 #define KEY_SIZE 8
 #define VALUE_SIZE 4096
