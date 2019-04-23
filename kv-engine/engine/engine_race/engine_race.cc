@@ -705,7 +705,7 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
   }
   pthread_mutex_unlock(&log_mu_);
 
-  ret = write_ahead_log_.SyncLog(); // sync the log file
+  write_ahead_log_.SyncLog(); // sync the log file
 
   pthread_mutex_lock(&mu_);
   Location location;
