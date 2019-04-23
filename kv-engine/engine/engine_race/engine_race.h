@@ -133,7 +133,6 @@ struct LogEntry {
 	char key[kMaxKeyLen];
 	char value[kMaxValueLen];
 	uint8_t valid;
-	uint8_t parity;
 };
 
 class WriteAheadLog {
@@ -149,7 +148,11 @@ class WriteAheadLog {
 		std::string dir_;
 		int fd_;
 		LogEntry * log_entrys_;
-		bool IsValid(LogEntry *entry);
+		int current_index;
+
+		inline bool IsValid(LogEntry * entry);
+		inline int GetFreeLogEntryIndex();
+		//void SetParity(LogEntry * entry);
 };
 
 /****************************************
@@ -164,7 +167,8 @@ class EngineRace : public Engine  {
 	  mu_(PTHREAD_MUTEX_INITIALIZER),
 	  db_lock_(NULL),
 	  plate_(dir),
-	  store_(dir) {
+	  store_(dir),
+	  write_ahead_log_(dir){
 	  }
 
   ~EngineRace();
@@ -188,6 +192,7 @@ class EngineRace : public Engine  {
   FileLock * db_lock_;
   DoorPlate plate_;
   DataStore store_;
+  WriteAheadLog write_ahead_log_;
 
 };
 

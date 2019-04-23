@@ -14,6 +14,8 @@
 
 #include "engine_race.h"
 
+#define barrier() __asm__ __volatile__("mfence" ::: "memory")
+
 namespace polar_race {
 
 /*******************************************************
@@ -457,11 +459,32 @@ RetCode WriteAheadLog::Init() {
 	}
 
 	log_entrys_ = reinterpret_cast<LogEntry*>(ptr);
+	current_index = 0;
 	return kSucc;
 }
 
 RetCode WriteAheadLog::Append(const std::string &key, const std::string &value) { 
-	// TODO
+	int index = GetFreeLogEntryIndex();
+	if (index < 0) {
+		return kFull; // the log entris are all used, which means the user should sync all change to the disk and diable all log entries before perform the lattest write operation
+	}
+
+	LogEntry * entry = log_entrys_ + index;
+	memcpy(entry->key, key.data(), key.size());
+	entry->key_size = key.size();
+	memcpy(entry->value, value.data(), value.size());
+	entry->value_size = value.size();
+
+	if (msync(entry->key, key.size(), MS_SYNC) != 0) return kIOError;
+	if (msync(entry->value, value.size(), MS_SYNC) != 0) return kIOError;
+	if (msync(&entry->key_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
+	if (msync(&entry->value_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
+	barrier();
+
+	entry->valid = 1;
+	if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError;
+	barrier();
+
 	return kSucc;
 }
 
@@ -471,25 +494,49 @@ RetCode WriteAheadLog::GetValidLogs(std::vector<std::pair<std::string ,std::stri
 }
 
 RetCode WriteAheadLog::DisableAllLogs() {
-	// TODO
+	for (int i = 0; i < kMaxLogEntryCnt; ++ i) {
+		(log_entrys_ + i)->valid = 0;
+	}
 	return kSucc;
 }
+
+int WriteAheadLog::GetFreeLogEntryIndex() {
+	for (; current_index < kMaxLogEntryCnt; ++ current_index) {
+		if (! IsValid(log_entrys_ + current_index)) {
+			return current_index;
+		}
+	}
+	return -1;
+}
+
+//void WriteAheadLog::SetParity(LogEntry * entry) {
+//	entry->parity = 0;
+//	uint8_t checksum = 0;
+//	const uint32_t entry_size = sizeof(LogEntry);
+//	uint8_t * entry_pos = (uint8_t *) entry;
+//	for (uint32_t i = 0; i < entry_size; ++ i) {
+//		checksum ^= (*entry_pos);
+//		entry_pos ++;
+//	}
+//	entry->parity = checksum;
+//}
 
 bool WriteAheadLog::IsValid(LogEntry * entry) {
 	if (entry->valid != 1) { // if the valid byte is 0, then this entry is not valid
 		return false;
 	}
-	uint8_t checksum = 0;
-	uint32_t entry_size = sizeof(LogEntry);
-	uint8_t * entry_pos = (uint8_t*) entry;
-	for (uint32_t i = 0; i < entry_size; ++ i) {
-		checksum ^= (*entry_pos);
-		entry_pos ++;
-	}
-	if (entry_pos != 0) { // if the parity is wrong, this entry is also invalid
-		return false;
-	}
 	return true;
+	//uint8_t checksum = 0;
+	//const uint32_t entry_size = sizeof(LogEntry);
+	//uint8_t * entry_pos = (uint8_t*) entry;
+	//for (uint32_t i = 0; i < entry_size; ++ i) {
+	//	checksum ^= (*entry_pos);
+	//	entry_pos ++;
+	//}
+	//if (entry_pos != 0) { // if the parity is wrong, this entry is also invalid
+	//	return false;
+	//}
+	//return true;
 }
 
 /************************************************************
@@ -529,6 +576,12 @@ RetCode EngineRace::Open(const std::string& name, Engine** eptr) {
 	  return ret;
   }
 
+  ret = engine_race->write_ahead_log_.Init();
+  if (ret != kSucc) {
+	  delete engine_race;
+	  return ret;
+  }
+
   if (LockFile(name + "/" + kLockFile, &(engine_race->db_lock_)) != 0) {
 	  delete engine_race;
 	  return kIOError;
@@ -553,6 +606,23 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
   // 3. disable the log after write operation
   
   pthread_mutex_lock(&mu_);
+  {
+          RetCode ret = write_ahead_log_.Append(key.ToString(), value.ToString());
+          //if (ret != kSucc) {
+          //        if (ret == kFull) { // all log entries have been used
+          //      	  // TODO do something...
+          //      	  write_ahead_log_.DisableAllLogs();
+          //      	  ret = write_ahead_log_.Append(key.ToString(), value.ToString());
+          //      	  if (ret != kSucc) {
+          //      	  	pthread_mutex_unlock(&mu_);
+          //      	  	return ret;
+          //      	  }
+          //        } else {
+          //      	  pthread_mutex_unlock(&mu_);
+          //      	  return ret;
+          //        }
+          //}
+  }
   Location location;
   RetCode ret = store_.Append(value.ToString(), &location);
   if (ret == kSucc) {
