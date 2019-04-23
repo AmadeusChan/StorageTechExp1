@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <utility>
 
 #include <stdint.h>
 #include <pthread.h>
@@ -15,6 +16,10 @@
 
 
 namespace polar_race {
+
+static const uint32_t kMaxKeyLen = 32;
+static const uint32_t kMaxValueLen = 4 * 1024 * 1024; // 4MB
+
 
 /*******************************************
  * Data Store
@@ -54,8 +59,6 @@ class DataStore  {
 /********************************************
  * Door Plate
  * ******************************************/
-
-static const uint32_t kMaxKeyLen = 32;
 
 struct Item {
   Item() : key_size(0), in_use(0) {
@@ -119,6 +122,35 @@ class FileLock  {
 
 int LockFile(const std::string& f, FileLock** l);
 int UnlockFile(FileLock* l);
+
+/***************************************
+ * Write-ahead log
+ * *************************************/
+
+struct LogEntry {
+	uint32_t key_size;
+	uint32_t value_size;
+	char key[kMaxKeyLen];
+	char value[kMaxValueLen];
+	uint8_t valid;
+	uint8_t parity;
+};
+
+class WriteAheadLog {
+	public:
+		explicit WriteAheadLog(const std::string &path);
+		~WriteAheadLog();
+
+		RetCode Init();
+		RetCode Append(const std::string &key, const std::string &value);
+		RetCode GetValidLogs(std::vector<std::pair<std::string, std::string>> *valid_logs); // vector<pair<key, value>>
+		RetCode DisableAllLogs();
+	private:
+		std::string dir_;
+		int fd_;
+		LogEntry * log_entrys_;
+		bool IsValid(LogEntry *entry);
+};
 
 /****************************************
  * KV-Engine

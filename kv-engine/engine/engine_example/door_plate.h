@@ -10,6 +10,9 @@
 
 namespace polar_race {
 
+// TODO 
+// change the max-len of key && value
+
 static const uint32_t kMaxKeyLen = 32;
 
 struct Item {

@@ -85,6 +85,10 @@ RetCode DataStore::Append(const std::string& value, Location* location) {
   if (0 != FileAppend(fd_, value)) {
     return kIOError;
   }
+  //if (fsync(fd_) != 0) { // to make sure the data arrive at the disk
+  //  return kIOError;
+  //}
+
   location->file_no = next_location_.file_no;
   location->offset = next_location_.offset;
   location->len = value.size();
@@ -248,6 +252,9 @@ RetCode DoorPlate::AddOrUpdate(const std::string& key, const Location& l) {
     iptr->in_use = 1;  // Place
   }
   iptr->location = l;
+
+  //msync(iptr, sizeof(Item), MS_SYNC); // sync the disk content
+
   return kSucc;
 }
 
@@ -386,7 +393,104 @@ int UnlockFile(FileLock* lock) {
   return result;
 }
 
+/***********************************************************
+ * Write ahead logging
+ ***********************************************************/
 
+/***********************************************************
+ * how to achieve crash consistency ? 
+ * 1. Before any write operation, write the <key, value> to the log;
+ * 2. If the log is full, sync the data-store && hash table, then disable all log entries;
+ * 3. After reboot, check if the log and finished all unfinished jobs;
+ ************************************************************/
+
+static const int kMaxLogEntryCnt = 128;
+static const char kLogFileName[] = "LOG";
+
+WriteAheadLog::WriteAheadLog(const std::string &path):
+	dir_(path), fd_(-1), log_entrys_(NULL){
+}
+
+WriteAheadLog::~WriteAheadLog() {
+	if (fd_ > 0) {
+		const int map_size = kMaxLogEntryCnt * sizeof(LogEntry);
+		munmap(log_entrys_, map_size);
+		close(fd_);
+	}
+}
+
+RetCode WriteAheadLog::Init() {
+	bool new_create = false;
+	const int map_size = kMaxLogEntryCnt * sizeof(LogEntry);
+
+	if (!FileExists(dir_) 
+			&& 0 != mkdir(dir_.c_str(), 0755)) {
+		return kIOError;
+	}
+
+	std::string path = dir_ + "/" + kLogFileName;
+	int fd = open(path.c_str(), O_RDWR, 0644);
+	if (fd < 0 && errno == ENOENT) { // the file doesn't exist
+		fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
+		if (fd >= 0) {
+			new_create = true;
+			if (posix_fallocate(fd, 0, map_size) != 0) {
+				std::cerr << "posix_fallocate failed: " << strerror(errno) << std::endl;
+				close(fd);
+				return kIOError;
+			}
+		}
+	}
+	if (fd < 0) {
+		return kIOError;
+	}
+	fd_ = fd;
+
+	void * ptr = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+	if (ptr == MAP_FAILED) {
+		std::cerr << "MAP_FAILED: " << strerror(errno) << std::endl;
+		close(fd);
+		return kIOError;
+	}
+	if (new_create) {
+		memset(ptr, 0, map_size);
+	}
+
+	log_entrys_ = reinterpret_cast<LogEntry*>(ptr);
+	return kSucc;
+}
+
+RetCode WriteAheadLog::Append(const std::string &key, const std::string &value) { 
+	// TODO
+	return kSucc;
+}
+
+RetCode WriteAheadLog::GetValidLogs(std::vector<std::pair<std::string ,std::string>> *valid_logs) {
+	// TODO
+	return kSucc;
+}
+
+RetCode WriteAheadLog::DisableAllLogs() {
+	// TODO
+	return kSucc;
+}
+
+bool WriteAheadLog::IsValid(LogEntry * entry) {
+	if (entry->valid != 1) { // if the valid byte is 0, then this entry is not valid
+		return false;
+	}
+	uint8_t checksum = 0;
+	uint32_t entry_size = sizeof(LogEntry);
+	uint8_t * entry_pos = (uint8_t*) entry;
+	for (uint32_t i = 0; i < entry_size; ++ i) {
+		checksum ^= (*entry_pos);
+		entry_pos ++;
+	}
+	if (entry_pos != 0) { // if the parity is wrong, this entry is also invalid
+		return false;
+	}
+	return true;
+}
 
 /************************************************************
  * KV-Engine
@@ -461,7 +565,6 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
 
 // 4. Read value of a key
 RetCode EngineRace::Read(const PolarString& key, std::string* value) {
-  // TODO 
   // simply the same as the sample call
   
   pthread_mutex_lock(&mu_);
