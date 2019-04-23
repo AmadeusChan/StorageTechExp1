@@ -15,6 +15,8 @@
 #include "engine_race.h"
 
 #define barrier() __asm__ __volatile__("mfence" ::: "memory")
+#define PAGESIZE 4096
+#define OFFSETOF(type, field)    ((unsigned long) &(((type *) 0)->field))
 
 namespace polar_race {
 
@@ -464,7 +466,11 @@ RetCode WriteAheadLog::Init() {
 }
 
 RetCode WriteAheadLog::Append(const std::string &key, const std::string &value) { 
-	int index = GetFreeLogEntryIndex();
+	int index;
+	while (true) {
+		index = __sync_fetch_and_add(&current_index, 1);
+		if (index < kMaxLogEntryCnt) break; // the entry is valid
+	}
 	if (index < 0) {
 		return kFull; // the log entris are all used, which means the user should sync all change to the disk and diable all log entries before perform the lattest write operation
 	}
@@ -475,14 +481,21 @@ RetCode WriteAheadLog::Append(const std::string &key, const std::string &value) 
 	memcpy(entry->value, value.data(), value.size());
 	entry->value_size = value.size();
 
-	if (msync(entry->key, key.size(), MS_SYNC) != 0) return kIOError;
-	if (msync(entry->value, value.size(), MS_SYNC) != 0) return kIOError;
-	if (msync(&entry->key_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
-	if (msync(&entry->value_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
+	uint32_t begin = sizeof(LogEntry) * index / PAGESIZE * PAGESIZE; // 4K alignment
+	uint32_t end = sizeof(LogEntry) * index + key.size();
+	if (end % PAGESIZE != 0) {
+		end = end / PAGESIZE * PAGESIZE + PAGESIZE;
+	} 
+
+
+	if (msync((void*)(log_entrys_) + begin, end - begin, MS_SYNC) != 0) return kIOError;
+	//if (msync(entry->value, value.size(), MS_SYNC) != 0) return kIOError;
+	//if (msync(&entry->key_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
+	//if (msync(&entry->value_size, sizeof(uint32_t), MS_SYNC) != 0) return kIOError;
 	barrier();
 
 	entry->valid = 1;
-	if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError;
+	//if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError;
 	barrier();
 
 	return kSucc;
@@ -494,9 +507,14 @@ RetCode WriteAheadLog::GetValidLogs(std::vector<std::pair<std::string ,std::stri
 }
 
 RetCode WriteAheadLog::DisableAllLogs() {
+	LogEntry * entry;
 	for (int i = 0; i < kMaxLogEntryCnt; ++ i) {
-		(log_entrys_ + i)->valid = 0;
+		entry = log_entrys_ + i;
+		entry->valid = 0;
+		//if (msync(&entry->valid, sizeof(uint8_t), MS_SYNC) != 0) return kIOError; TODO
 	}
+	current_index = 0;
+	barrier();
 	return kSucc;
 }
 
@@ -605,24 +623,32 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
   // 2. write the WAL before perform actual write operation
   // 3. disable the log after write operation
   
-  pthread_mutex_lock(&mu_);
+  //pthread_mutex_lock(&log_mu_);
   {
           RetCode ret = write_ahead_log_.Append(key.ToString(), value.ToString());
-          //if (ret != kSucc) {
-          //        if (ret == kFull) { // all log entries have been used
-          //      	  // TODO do something...
-          //      	  write_ahead_log_.DisableAllLogs();
-          //      	  ret = write_ahead_log_.Append(key.ToString(), value.ToString());
-          //      	  if (ret != kSucc) {
-          //      	  	pthread_mutex_unlock(&mu_);
-          //      	  	return ret;
-          //      	  }
-          //        } else {
-          //      	  pthread_mutex_unlock(&mu_);
-          //      	  return ret;
-          //        }
-          //}
+          if (ret != kSucc) {
+                  if (ret == kFull) { // all log entries have been used
+			  //std::cout << "log table is full..\n";
+                	  // TODO do something...
+                	  write_ahead_log_.DisableAllLogs();
+                	  ret = write_ahead_log_.Append(key.ToString(), value.ToString());
+                	  if (ret != kSucc) {
+				  std::cout << "still not success...\n";
+                	  	//pthread_mutex_unlock(&log_mu_);
+                	  	return ret;
+                	  }
+                  } else {
+			  std::cout << "PageSize: " << PAGESIZE << std::endl;
+			  std::cout << "other mis?\n";
+			  std::cout << "is kioerror?" << (ret == kIOError) << std::endl;
+                	  //pthread_mutex_unlock(&log_mu_);
+                	  return ret;
+                  }
+          }
   }
+  //pthread_mutex_unlock(&log_mu_);
+
+  pthread_mutex_lock(&mu_);
   Location location;
   RetCode ret = store_.Append(value.ToString(), &location);
   if (ret == kSucc) {

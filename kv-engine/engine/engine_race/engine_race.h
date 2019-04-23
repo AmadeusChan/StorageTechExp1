@@ -128,12 +128,12 @@ int UnlockFile(FileLock* l);
  * *************************************/
 
 struct LogEntry {
-	uint32_t key_size;
-	uint32_t value_size;
 	char key[kMaxKeyLen];
 	char value[kMaxValueLen];
+	uint32_t key_size;
+	uint32_t value_size;
 	uint8_t valid;
-};
+} __attribute__((packed));
 
 class WriteAheadLog {
 	public:
@@ -148,7 +148,7 @@ class WriteAheadLog {
 		std::string dir_;
 		int fd_;
 		LogEntry * log_entrys_;
-		int current_index;
+		volatile int current_index;
 
 		inline bool IsValid(LogEntry * entry);
 		inline int GetFreeLogEntryIndex();
@@ -165,6 +165,7 @@ class EngineRace : public Engine  {
 
   explicit EngineRace(const std::string& dir):
 	  mu_(PTHREAD_MUTEX_INITIALIZER),
+	  log_mu_(PTHREAD_MUTEX_INITIALIZER),
 	  db_lock_(NULL),
 	  plate_(dir),
 	  store_(dir),
@@ -189,6 +190,7 @@ class EngineRace : public Engine  {
 
  private: 
   pthread_mutex_t mu_;
+  pthread_mutex_t log_mu_;
   FileLock * db_lock_;
   DoorPlate plate_;
   DataStore store_;
