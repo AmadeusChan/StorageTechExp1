@@ -614,8 +614,7 @@ RetCode EngineRace::Open(const std::string& name, Engine** eptr) {
   *eptr = NULL;
   EngineRace *engine_race = new EngineRace(name);
 
-  // TODO 
-  // 1. check the log to determine if there is some pending write operation
+  // 1. [check] check the log to determine if there is some pending write operation
   
   RetCode ret = engine_race->plate_.Init();
   if (ret != kSucc) {
@@ -660,10 +659,9 @@ EngineRace::~EngineRace() {
 
 // 3. Write a key-value pair into engine
 RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
-  // TODO
-  // 1. added fsync && msync call to make sure that all modification arrive at the disk in time
-  // 2. write the WAL before perform actual write operation
-  // 3. disable the log after write operation
+  // 1. [check]added fsync && msync call to make sure that all modification arrive at the disk in time
+  // 2. [check]write the WAL before perform actual write operation
+  // 3. [check]disable the log after write operation
   
   std::string key_str = key.ToString();
   std::string value_str = value.ToString();
@@ -707,6 +705,8 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
   }
   pthread_mutex_unlock(&log_mu_);
 
+  ret = write_ahead_log_.SyncLog(); // sync the log file
+
   pthread_mutex_lock(&mu_);
   Location location;
   RetCode ret = store_.Append(value_str, &location);
@@ -714,8 +714,6 @@ RetCode EngineRace::Write(const PolarString& key, const PolarString& value) {
 	  ret = plate_.AddOrUpdate(key_str, location);
   }
   pthread_mutex_unlock(&mu_);
-
-  ret = write_ahead_log_.SyncLog(); // sync the log file
 
   return ret;
 }
